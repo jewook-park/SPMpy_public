@@ -35,31 +35,209 @@
 import numpy as np
 import xarray as xr
 
+# %% [markdown]
+# # plane_fit_xr – Updated Implementation (2026-01-05)
+#
+# This notebook documents an update to `plane_fit_xr`.
+#
+# ## plane_fit_xr (Internal) – Background Removal with Mask, Mean Preservation, and Robust Axis Inference
+#
+# This cell provides a self-contained implementation of polynomial background removal for STM/SPM data
+# stored as `xarray.Dataset` or `xarray.DataArray`.
+#
+# ### Supported data shapes
+# - **2D images**: `(Y, X)` or `(y, x)` or any two spatial dims
+# - **Grid spectroscopy**: `(bias_mV, Y, X)` (background removal is applied independently for each bias slice)
+#
+# ### Key behaviors
+# 1. **Robust axis inference**
+#    - Works when dims are named `(Y, X)` or `(y, x)` (case-insensitive).
+#    - Ensures **horizontal axis is x** and **vertical axis is y**.
+#    - If dim names do not indicate x/y, the fallback assumes the last two non-bias dims are `(y, x)`.
+#
+# 2. **Mask support**
+#    - `mask == True` : included in fitting
+#    - `mask == False`: excluded from fitting
+#    - If `mask is None`, all pixels are used.
+#
+# 3. **Mean preservation (default)**
+#    - `remove_mean=True` (default): subtract the mean temporarily for fit stability, then restore the original mean.
+#    - Mean preservation is applied:
+#      - for a single 2D image (global image mean)
+#      - for each `bias_mV` slice independently (slice mean)
+#
+# 4. **Offset-preserving 1D fits (always enabled)**
+#    - For `x_fit` and `y_fit`, the algorithm removes **only non-constant polynomial components**
+#      (tilt/curvature terms) and preserves the DC offset.
+#    - This avoids unintended row/column mean equalization artifacts.
+#
+# ### Methods
+# - `surface_fit`: 2D polynomial surface fit over (x,y) and subtraction
+# - `x_fit`: per-row polynomial fit along x, subtract only non-constant components
+# - `y_fit`: per-column polynomial fit along y, subtract only non-constant components
+#
+# ---
+#
+# ## Usage Examples
+#
+# ### Example 1) Surface fit on all channels (recommended default)
+# ```python
+# ds_corr = plane_fit_xr(
+#     ds_sxm,
+#     ch='all',
+#     method='surface_fit',
+#     poly_order=1,
+#     mask=None,
+#     overwrite=False
+# )
+#
 
 # %%
+import numpy as np
+import xarray as xr
 
-def _polyfit_1d_with_mask(coord, data, order, mask):
+
+def _infer_xy_dims(da: xr.DataArray, bias_dim: str = "bias_mV"):
     """
-    Perform 1D polynomial fitting with explicit mask control.
+    Infer (y_dim, x_dim) for a 2D spatial map from an xarray.DataArray.
+
+    This function is designed for STM/SPM images where:
+      - the horizontal axis should correspond to x
+      - the vertical axis should correspond to y
+
+    Strategy (robust + conservative)
+    -------------------------------
+    1) If dimension names clearly indicate x/y (case-insensitive), use them:
+       - x candidates: dim name contains 'x' (e.g., 'x', 'X', 'X_nm', 'x_pix')
+       - y candidates: dim name contains 'y' (e.g., 'y', 'Y', 'Y_nm', 'y_pix')
+       If both exist, return (y_dim, x_dim).
+
+    2) Otherwise, ignore `bias_dim` (if present) and fall back to:
+       - last two remaining dims treated as (y, x) in that order.
+
+    Notes
+    -----
+    - For typical STM xarray datasets, dims are usually (Y, X) or (y, x).
+    - If the data are stored as (X, Y) but dim names are not informative,
+      automatic inference is ambiguous. In that rare case, the fallback
+      assumes the first of the two dims is y and the second is x.
+    """
+    dims = list(da.dims)
+    spatial_dims = [d for d in dims if d != bias_dim]
+
+    if len(spatial_dims) != 2:
+        raise ValueError(
+            f"Cannot infer (y,x) dims. Expected 2 spatial dims, got {spatial_dims} from da.dims={da.dims}"
+        )
+
+    def _is_x(name: str) -> bool:
+        return "x" in name.lower()
+
+    def _is_y(name: str) -> bool:
+        return "y" in name.lower()
+
+    x_candidates = [d for d in spatial_dims if _is_x(d)]
+    y_candidates = [d for d in spatial_dims if _is_y(d)]
+
+    if x_candidates and y_candidates:
+        x_dim = x_candidates[0]
+        y_dim = y_candidates[0]
+        return y_dim, x_dim
+
+    # Fallback: assume (y, x) order
+    y_dim, x_dim = spatial_dims[0], spatial_dims[1]
+    return y_dim, x_dim
+
+
+def _masked_mean_2d(arr2d: np.ndarray, mask2d: np.ndarray | None):
+    """
+    Compute mean of a 2D array with optional mask support.
+
+    Mask semantics
+    --------------
+    mask == True  : included in mean calculation
+    mask == False : excluded
+
+    If mask is None, the full-array nanmean is used.
+    If mask has no True entries, falls back to full-array nanmean.
+    """
+    if mask2d is None:
+        return float(np.nanmean(arr2d))
+    if np.any(mask2d):
+        return float(np.nanmean(arr2d[mask2d]))
+    return float(np.nanmean(arr2d))
+
+
+def _polyfit_1d_preserve_offset(coord: np.ndarray,
+                                values: np.ndarray,
+                                deg: int,
+                                mask_1d: np.ndarray | None = None) -> np.ndarray:
+    """
+    Fit a 1D polynomial background with optional mask and return ONLY the
+    non-constant component evaluated across the full coordinate axis.
+
+    Purpose
+    -------
+    For per-row or per-column fitting (x_fit / y_fit), subtracting the full
+    polynomial (including intercept) removes DC offsets and can unintentionally
+    equalize row/column means.
+
+    This function ALWAYS preserves offsets by:
+      - fitting a polynomial p(coord)
+      - returning p(coord) with its constant term forced to zero
+        (i.e., remove tilt/curvature terms only)
+
+    Numerical stability
+    -------------------
+    - Coordinates are centered before fitting: dcoord = coord - mean(coord_fit)
+      This reduces condition issues when coordinates are small (e.g., meters).
 
     Mask semantics
     --------------
     mask == True  : included in fitting
-    mask == False : excluded from fitting
+    mask == False : excluded
 
-    Notes
-    -----
-    - mask may be sparse (point-like selection).
-    - If mask is None, all points are used.
+    Returns
+    -------
+    fit_no_const : np.ndarray
+        Polynomial background WITHOUT the constant term.
+        Subtracting this from the data preserves the DC offset.
     """
-    if mask is None:
-        mask = np.ones_like(data, dtype=bool)
+    coord = np.asarray(coord, dtype=float)
+    values = np.asarray(values, dtype=float)
 
-    coeff = np.polyfit(coord[mask], data[mask], order)
-    return np.polyval(coeff, coord)
+    # Select fitting points
+    if mask_1d is None:
+        coord_fit = coord
+        values_fit = values
+    else:
+        coord_fit = coord[mask_1d]
+        values_fit = values[mask_1d]
+
+    # Need at least deg+1 points
+    if coord_fit.size < (deg + 1):
+        return np.zeros_like(values, dtype=float)
+
+    # Center coordinates for stability
+    c0 = float(np.mean(coord_fit))
+    dcoord = coord - c0
+    dcoord_fit = coord_fit - c0
+
+    # Polynomial fit in centered coordinates
+    coeff = np.polyfit(dcoord_fit, values_fit, deg=deg)  # highest power first
+
+    # Force constant term to zero (preserve offset)
+    coeff[-1] = 0.0
+
+    fit_no_const = np.polyval(coeff, dcoord)
+    return fit_no_const
 
 
-def _polyfit_surface_with_mask(x, y, z, order, mask):
+def _polyfit_surface_with_mask(x: np.ndarray,
+                               y: np.ndarray,
+                               z: np.ndarray,
+                               order: int,
+                               mask: np.ndarray | None):
     """
     Perform 2D polynomial surface fitting with mask support.
 
@@ -72,13 +250,17 @@ def _polyfit_surface_with_mask(x, y, z, order, mask):
     Mask semantics
     --------------
     mask == True  : included in fitting
-    mask == False : excluded from fitting
+    mask == False : excluded
 
     Notes
     -----
     - mask may be sparse or continuous.
     - If mask is None, the entire image is used.
     """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    z = np.asarray(z, dtype=float)
+
     X, Y = np.meshgrid(x, y)
 
     if mask is None:
@@ -126,67 +308,48 @@ def _polyfit_surface_with_mask(x, y, z, order, mask):
     return surface
 
 
-
-# %% [markdown]
-#
-# # plane_fit_xr – Updated Implementation (2026-01-05)
-#
-# This notebook documents an update to `plane_fit_xr`.
-#
-# ## Summary of Update
-# - Added an explicit **mean removal option** (`remove_mean=False` by default)
-# - Ensured **x-fit and y-fit symmetry**
-# - Removed unintended row-wise normalization in `x_fit`
-# - Updated docstring and usage explanation
-# - Clarified physical meaning of each option
-#
-# This update was motivated by observed artifacts where `x_fit` produced
-# row-wise mean-equalized (high-pass–like) results.
-#
-
-# %% [markdown]
-#
-# ## What Was Changed (Changelog)
-#
-# 1. **New parameter added**
-#    - `remove_mean: bool = False`
-#    - Controls optional mean-centering before fitting
-#
-# 2. **Default behavior changed**
-#    - Mean removal is **disabled by default**
-#    - Preserves physical offsets and gradients
-#
-# 3. **x_fit behavior corrected**
-#    - Removed implicit `mean(dim='x')` normalization
-#    - Each y-row now retains its own average value
-#
-# 4. **Documentation updated**
-#    - Docstring expanded
-#    - Explicit warning about high-pass behavior when `remove_mean=True`
-#
-
-# %%
-import numpy as np
-import xarray as xr
-
 def plane_fit_xr(
     xrdata,
-    ch='all',
-    method='surface_fit',
-    poly_order=1,
-    remove_mean=False,
+    ch: str = 'all',
+    method: str = 'surface_fit',
+    poly_order: int = 1,
+    remove_mean: bool = True,
     mask=None,
-    overwrite=False
+    overwrite: bool = False
 ):
     """
-    Polynomial plane / surface background removal for STM-SPM data.
+    Polynomial plane / surface background removal for STM-SPM data (xarray).
 
-    This function applies polynomial background fitting to:
-    - 2D STM images (y, x) (e.g., topography, current, lock-in channels)
-    - Grid spectroscopy data (bias_mV, y, x)
+    Applies polynomial background fitting to:
+    - 2D STM images: (Y, X) / (y, x) / arbitrary 2D spatial dims
+    - Grid spectroscopy: (bias_mV, Y, X) (fit independently per bias slice)
 
-    The goal is to remove low-order background trends (tilt/curvature) while
-    preserving physically meaningful variations.
+    Core behaviors
+    --------------
+    1) Robust x/y axis inference:
+       - Accepts dims named (y,x) or (Y,X) (case-insensitive).
+       - Ensures horizontal axis corresponds to x and vertical axis to y.
+       - If names are ambiguous, assumes the last two spatial dims are (y,x).
+
+    2) Mask support (mask==True included):
+       - mask == True  : included in fitting
+       - mask == False : excluded
+
+    3) Mean preservation with stability centering (DEFAULT):
+       - If remove_mean=True (default):
+           (a) compute original mean (per 2D map; per bias slice for grid)
+           (b) subtract mean temporarily for numerical stability
+           (c) fit and subtract background
+           (d) restore the original mean to the corrected output
+         => output mean equals input mean (physically preserved)
+
+       - If remove_mean=False:
+           fit is performed on the original values (no temporary centering)
+
+    4) Offset-preserving 1D fits ALWAYS:
+       - For x_fit and y_fit:
+         only non-constant polynomial components are removed, preserving DC offsets.
+         This avoids unintended row/column mean equalization artifacts.
 
     Parameters
     ----------
@@ -194,78 +357,39 @@ def plane_fit_xr(
         Input STM/SPM data. If a DataArray is given, it is converted internally
         to a Dataset. Output is always a Dataset.
 
-        Typical 2D image variables:
-            (Y, X) or (y, x)
-        Typical grid variables:
-            (bias_mV, Y, X)
-
     ch : str, default 'all'
         Channel selection.
         - 'all' : apply fitting to all data variables
-        - specific variable name (e.g. 'Z_fwd', 'CURR_fwd')
+        - specific variable name (e.g. 'Z_fwd')
 
     method : {'x_fit', 'y_fit', 'surface_fit'}, default 'surface_fit'
         Background fitting method.
-        - 'x_fit'      : polynomial fit along x direction (row-wise; each fixed y)
-        - 'y_fit'      : polynomial fit along y direction (column-wise; each fixed x)
-        - 'surface_fit': full 2D polynomial surface fit (x,y) -> z
+        - x_fit      : per-row polynomial fit along x
+        - y_fit      : per-column polynomial fit along y
+        - surface_fit: full 2D polynomial surface fit
 
     poly_order : int, default 1
         Polynomial order of fitting (1, 2, or 3).
 
-    remove_mean : bool, default False
-        If True, mean-centering is applied *before* fitting.
-
-        Behavior by method
-        ------------------
-        - method='x_fit':
-            For each y-row, subtract the row mean (along x) before polynomial fitting.
-            This enforces identical mean values across x for each row and can introduce
-            a high-pass–like appearance. Use only when intentionally desired.
-
-        - method='y_fit':
-            For each x-column, subtract the column mean (along y) before polynomial fitting.
-            Similarly, this can impose mean normalization and should be used with caution.
-
-        - method='surface_fit':
-            Subtract a global mean (over the 2D image) before surface fitting.
-            This mainly removes constant offset prior to fitting.
-
-        WARNING
-        -------
-        Setting remove_mean=True changes the physical meaning of the output:
-        it may suppress legitimate offsets/slow variations and resemble a high-pass filter,
-        especially for x_fit/y_fit. Keep remove_mean=False for standard plane/tilt removal.
+    remove_mean : bool, default True
+        Temporary mean centering for fit stability.
+        Mean is restored after background subtraction so that output mean equals input mean.
 
     mask : ndarray of bool, optional
         Boolean mask specifying which pixels are INCLUDED in fitting.
-
-        mask == True  → used for fitting
-        mask == False → excluded from fitting
-
-        Notes:
-        - mask may be sparse (point mask).
-        - If None, all pixels are used.
-        - For x_fit/y_fit, the 1D mask is extracted per row/column accordingly.
+        mask must match the 2D spatial shape (Y,X) for images and per-slice grids.
 
     overwrite : bool, default False
         Storage behavior.
-        - False : fitted result stored as '{var}_planefit'
+        - False : store result as '{var}_planefit'
         - True  : overwrite original variable
-
-    Special behavior (grid spectroscopy)
-    -----------------------------------
-    If a variable contains a 'bias_mV' dimension, background fitting is applied
-    independently for each bias slice (2D image at each bias).
 
     Returns
     -------
     xarray.Dataset
-        Dataset containing plane-fitted data (either overwritten or appended
-        as '{var}_planefit').
+        Dataset containing background-corrected data.
     """
-
-    # --- normalize input to Dataset ---
+    # Normalize input to Dataset
     if isinstance(xrdata, xr.DataArray):
         ds = xrdata.to_dataset(name=xrdata.name or 'data')
     elif isinstance(xrdata, xr.Dataset):
@@ -273,41 +397,76 @@ def plane_fit_xr(
     else:
         raise TypeError("Input must be xarray.Dataset or xarray.DataArray")
 
-    # --- channel selection ---
+    # Channel selection
     if ch == 'all':
         ch_list = list(ds.data_vars)
     else:
         if ch not in ds.data_vars:
-            raise ValueError(f"Channel '{ch}' not found")
+            raise ValueError(f"Channel '{ch}' not found in Dataset")
         ch_list = [ch]
 
     for var in ch_list:
         da = ds[var]
 
-        # =========================
-        # 1) Grid spectroscopy case
-        # =========================
+        # -------------------------
+        # Grid spectroscopy handling
+        # -------------------------
         if 'bias_mV' in da.dims:
+            y_dim, x_dim = _infer_xy_dims(da, bias_dim='bias_mV')
+            mask2d = None if mask is None else mask
+
             fitted_stack = []
+            for ib in range(da.sizes['bias_mV']):
+                slice2d = da.isel(bias_mV=ib)  # 2D DataArray
 
-            for ib, b in enumerate(da.bias_mV.values):
-                slice2d = da.isel(bias_mV=ib)
+                data2d = slice2d.values.astype(float, copy=False)
+                slice_mean = _masked_mean_2d(data2d, mask2d)
 
-                # mask: assume same 2D mask applies to each bias slice (if provided)
-                slice_mask = None if mask is None else mask
+                # Temporary centering for stability (default True)
+                if remove_mean:
+                    data_work = data2d - slice_mean
+                else:
+                    data_work = data2d
 
-                # IMPORTANT: propagate remove_mean option into per-slice fitting
-                slice_out = plane_fit_xr(
-                    slice2d,
-                    ch=slice2d.name,
-                    method=method,
-                    poly_order=poly_order,
-                    remove_mean=remove_mean,
-                    mask=slice_mask,
-                    overwrite=True
+                x = slice2d[x_dim].values
+                y = slice2d[y_dim].values
+
+                if method == 'surface_fit':
+                    surface = _polyfit_surface_with_mask(x, y, data_work, poly_order, mask2d)
+                    corrected = data_work - surface
+
+                elif method == 'x_fit':
+                    corrected = np.zeros_like(data_work, dtype=float)
+                    ny, nx = data_work.shape
+                    for iy in range(ny):
+                        row = data_work[iy]
+                        row_mask = None if mask2d is None else mask2d[iy]
+                        fit_no_const = _polyfit_1d_preserve_offset(x, row, poly_order, row_mask)
+                        corrected[iy] = row - fit_no_const
+
+                elif method == 'y_fit':
+                    corrected = np.zeros_like(data_work, dtype=float)
+                    ny, nx = data_work.shape
+                    for ix in range(nx):
+                        col = data_work[:, ix]
+                        col_mask = None if mask2d is None else mask2d[:, ix]
+                        fit_no_const = _polyfit_1d_preserve_offset(y, col, poly_order, col_mask)
+                        corrected[:, ix] = col - fit_no_const
+
+                else:
+                    raise ValueError("Invalid method. Choose from {'x_fit','y_fit','surface_fit'}.")
+
+                # Restore original mean (preserve physical mean per bias slice)
+                if remove_mean:
+                    corrected = corrected + slice_mean
+
+                slice_out = xr.DataArray(
+                    corrected,
+                    coords={y_dim: slice2d[y_dim], x_dim: slice2d[x_dim]},
+                    dims=(y_dim, x_dim),
+                    attrs=slice2d.attrs
                 )
-
-                fitted_stack.append(slice_out[slice2d.name].values)
+                fitted_stack.append(slice_out.values)
 
             axis = da.dims.index('bias_mV')
             fitted = np.stack(fitted_stack, axis=axis)
@@ -319,83 +478,60 @@ def plane_fit_xr(
                 attrs=da.attrs
             )
 
-        # =================
-        # 2) Pure 2D images
-        # =================
+        # -------------------------
+        # Pure 2D image handling
+        # -------------------------
         else:
-            data2d = da.values
-            ny, nx = data2d.shape
+            y_dim, x_dim = _infer_xy_dims(da, bias_dim='bias_mV')
+            mask2d = None if mask is None else mask
 
-            # Use coordinate values if available (assumes dims order is (y, x))
-            x = da.coords[da.dims[1]].values if len(da.dims) == 2 else np.arange(nx)
-            y = da.coords[da.dims[0]].values if len(da.dims) == 2 else np.arange(ny)
+            data2d = da.values.astype(float, copy=False)
+            img_mean = _masked_mean_2d(data2d, mask2d)
 
-            # ---- surface fit (2D polynomial) ----
+            if remove_mean:
+                data_work = data2d - img_mean
+            else:
+                data_work = data2d
+
+            x = da[x_dim].values
+            y = da[y_dim].values
+
             if method == 'surface_fit':
-                # Optional global mean removal (constant offset)
-                if remove_mean:
-                    data_work = data2d - np.nanmean(data2d)
-                else:
-                    data_work = data2d
+                surface = _polyfit_surface_with_mask(x, y, data_work, poly_order, mask2d)
+                corrected = data_work - surface
 
-                surface = _polyfit_surface_with_mask(x, y, data_work, poly_order, mask)
-                result_np = data_work - surface
-
-            # ---- x_fit (row-wise along x) ----
             elif method == 'x_fit':
-                result_np = np.zeros_like(data2d)
-
+                corrected = np.zeros_like(data_work, dtype=float)
+                ny, nx = data_work.shape
                 for iy in range(ny):
-                    row = data2d[iy].astype(float, copy=False)
-                    row_mask = None if mask is None else mask[iy]
+                    row = data_work[iy]
+                    row_mask = None if mask2d is None else mask2d[iy]
+                    fit_no_const = _polyfit_1d_preserve_offset(x, row, poly_order, row_mask)
+                    corrected[iy] = row - fit_no_const
 
-                    # Optional mean-centering per row (explicit option)
-                    if remove_mean:
-                        # Mean of the INCLUDED pixels if a mask is given, else full row mean
-                        if row_mask is None:
-                            row_mean = np.nanmean(row)
-                        else:
-                            row_mean = np.nanmean(row[row_mask]) if np.any(row_mask) else np.nanmean(row)
-                        row_work = row - row_mean
-                    else:
-                        row_work = row
-
-                    fit = _polyfit_1d_with_mask(x, row_work, poly_order, row_mask)
-                    result_np[iy] = row_work - fit
-
-            # ---- y_fit (column-wise along y) ----
             elif method == 'y_fit':
-                result_np = np.zeros_like(data2d)
-
+                corrected = np.zeros_like(data_work, dtype=float)
+                ny, nx = data_work.shape
                 for ix in range(nx):
-                    col = data2d[:, ix].astype(float, copy=False)
-                    col_mask = None if mask is None else mask[:, ix]
-
-                    # Optional mean-centering per column (explicit option)
-                    if remove_mean:
-                        # Mean of the INCLUDED pixels if a mask is given, else full column mean
-                        if col_mask is None:
-                            col_mean = np.nanmean(col)
-                        else:
-                            col_mean = np.nanmean(col[col_mask]) if np.any(col_mask) else np.nanmean(col)
-                        col_work = col - col_mean
-                    else:
-                        col_work = col
-
-                    fit = _polyfit_1d_with_mask(y, col_work, poly_order, col_mask)
-                    result_np[:, ix] = col_work - fit
+                    col = data_work[:, ix]
+                    col_mask = None if mask2d is None else mask2d[:, ix]
+                    fit_no_const = _polyfit_1d_preserve_offset(y, col, poly_order, col_mask)
+                    corrected[:, ix] = col - fit_no_const
 
             else:
                 raise ValueError("Invalid method. Choose from {'x_fit','y_fit','surface_fit'}.")
 
+            if remove_mean:
+                corrected = corrected + img_mean
+
             result = xr.DataArray(
-                result_np,
+                corrected,
                 coords=da.coords,
                 dims=da.dims,
                 attrs=da.attrs
             )
 
-        # ---- store output ----
+        # Store output
         if overwrite:
             ds[var] = result
         else:
@@ -403,17 +539,3 @@ def plane_fit_xr(
 
     return ds
 
-
-# %% [markdown]
-#
-# ## Practical Recommendation
-#
-# - **Default (`remove_mean=False`)**  
-#   Use for physically meaningful plane / tilt removal.
-#
-# - **Optional (`remove_mean=True`)**  
-#   Use only when intentional high-pass filtering is desired.
-#   Always document this choice in figure captions or subtitles.
-#
-# This design makes the behavior **explicit, symmetric, and reproducible**.
-#
