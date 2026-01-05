@@ -32,6 +32,10 @@ is not intended for public exposure at this stage.
 
 Access is limited to **STM group members at CNMS**.
 
+Access to this private repository is granted by invitation.
+Please accept the GitHub invitation before cloning.
+
+
 ---
 
 ## _For STMers in the CNMS STM Group_
