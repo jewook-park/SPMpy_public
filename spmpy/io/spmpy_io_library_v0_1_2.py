@@ -13,7 +13,7 @@
 #     name: python3
 # ---
 
-# # SPMpy I/O Library v0.1.1 (Notebook-paired)
+# ## SPMpy I/O Library v0.1.2 (Notebook-paired)
 #
 # This notebook contains the **I/O function set** intended to live under `spmpy/io/`.
 # It is designed to be **paired with a `.py` file via jupytext**.
@@ -375,9 +375,9 @@ def grid2xr(griddata_file: str, center_offset: bool = True) -> xr.Dataset:
 
     title = f"{basename}\n" \
             f"{round(roi_x_nm)} nm x {round(roi_y_nm)} nm  " \
-            f"Bias = {bias_set_mV:.2f} mV, I_t = {round(setpoint_pA)} pA"
+            f"V = {bias_set_mV:.2f} mV, I = {round(setpoint_pA)} pA"
     if rot_deg is not None and not math.isclose(rot_deg, 0.0):
-        title += f"  R={int(round(rot_deg))}deg"
+        title += f"  R = {int(round(rot_deg))}deg"
 
     # Keep sweep range as a second line (useful for grids)
     try:
@@ -851,9 +851,12 @@ def img2xr(loading_sxm_file: str, center_offset: bool = False) -> xr.Dataset:
     roi_y_nm = float(size_y) * 1e9
     bias_mV = 1000.0 * float(V_b)
     setpoint_pA = 1e12 * float(I_t)
-    base_title = f"{basename}\n" \
-                 f"{round(roi_x_nm)} nm x {round(roi_y_nm)} nm  " \
-                 f"Bias = {bias_mV:.2f} mV, I_t = {round(setpoint_pA)} pA"
+    base_title = (
+        f"{basename}\n"
+        f"{round(roi_x_nm)} nm x {round(roi_y_nm)} nm, "
+        f"V = {bias_mV:.0f} mV, "
+        f"I = {round(setpoint_pA)} pA"
+    )
     if not math.isclose(Rot_Rad, 0.0):
         base_title += f"  R={int(round(math.degrees(Rot_Rad)))}deg"
 
