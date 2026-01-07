@@ -413,7 +413,7 @@ def grid2xr(griddata_file: str, center_offset: bool = True) -> xr.Dataset:
 # Stage-0 should ensure dependencies are available. If `nanonispy` is missing, this function raises a clear error.
 #
 
-def img2xr(loading_sxm_file: str, center_offset: bool = False) -> xr.Dataset:
+def img2xr(loading_sxm_file: str, center_offset: bool = True) -> xr.Dataset:
     """
     Convert a Nanonis `.sxm` image file into an `xarray.Dataset`.
 
@@ -840,7 +840,10 @@ def img2xr(loading_sxm_file: str, center_offset: bool = False) -> xr.Dataset:
     else:
         eff_dx, eff_dy = step_dx, step_dy
 
-    if not center_offset:
+    # Apply center offset ONLY when requested
+    # center_offset=True  -> shift to lower-left origin
+    # center_offset=False -> keep centered coordinates
+    if center_offset:
         ds = ds.assign_coords(
             X=(ds["X"] + (cntr_x - size_x / 2.0)),
             Y=(ds["Y"] + (cntr_y - size_y / 2.0)),
