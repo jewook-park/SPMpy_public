@@ -1,11 +1,11 @@
 # ---
 # jupyter:
 #   jupytext:
-#     formats: ipynb,py:light
+#     formats: ipynb,py:percent
 #     text_representation:
 #       extension: .py
-#       format_name: light
-#       format_version: '1.5'
+#       format_name: percent
+#       format_version: '1.3'
 #       jupytext_version: 1.18.1
 #   kernelspec:
 #     display_name: Python 3 (ipykernel)
@@ -13,6 +13,7 @@
 #     name: python3
 # ---
 
+# %% [markdown]
 # # twoDfft_xrft / twoDifft_xrft — 2D FFT and inverse FFT Utilities for STM Images (xarray)
 #
 # This notebook documents the **forward and inverse 2D Fourier transform utilities**
@@ -154,7 +155,7 @@
 # - Retaining the complex FFT output enables mathematically consistent inverse FFT
 #   and frequency-domain filtering workflows.
 
-# +
+# %%
 import numpy as np
 import xarray as xr
 
@@ -251,7 +252,7 @@ def twoDfft_xrft(
     return out
 
 
-# +
+# %%
 import numpy as np
 import xarray as xr
 
@@ -312,3 +313,102 @@ def twoDifft_xrft(
         out[f"{ch}_ifft"] = da_ifft
 
     return out
+
+
+# %% [markdown]
+#
+# ## 🔄 FFT / IFFT Complex Data Storage Update (NetCDF-safe)
+#
+# ### FFT 저장 규칙 (업데이트)
+# - 기본(default):
+#   - FFT 결과는 **amplitude (`_amp`)** 와 **phase (`_phase`)** 두 채널로 저장
+# - 옵션 `save_complex=True` 인 경우:
+#   - 복소 FFT 결과를 **real (`_real`)**, **imaginary (`_imag`)** 채널로 추가 저장
+# - 옵션 `save_both=True` 인 경우:
+#   - `amp/phase` 와 `real/imag` **모두 저장**
+#
+# ### FFT 저장 후 출력 메시지
+# - 저장 시 다음 중 하나를 명시적으로 출력:
+#   - `FFT result saved as: amplitude + phase`
+#   - `FFT result saved as: real + imaginary`
+#   - `FFT result saved as: amplitude+phase and real+imaginary`
+#
+# ### IFFT 기본 동작
+# - 기본(default):
+#   - 저장된 **amplitude + phase** 로부터 복소수를 재구성하여 IFFT 수행
+# - 만약 입력 Dataset에:
+#   - `_real` 과 `_imag` 가 **모두 존재**하는 경우:
+#     - `_amp`, `_phase` 대신 **real + imaginary 기반**으로 IFFT 수행
+#     - 출력 메시지:
+#       - `IFFT computed from real + imaginary channels`
+#
+# ### 복소수 재구성 규칙
+# - amplitude / phase 기반:
+#   - `complex = amp * exp(1j * phase)`
+# - real / imaginary 기반:
+#   - `complex = real + 1j * imag`
+#
+# ### NetCDF-safe attrs 저장 규칙
+# - 모든 attrs 값은 다음 중 하나로 강제 변환:
+#   - scalar (int, float)
+#   - string
+# - dict, list, ndarray 등은 문자열로 변환하여 저장
+#
+
+# %%
+
+import numpy as np
+import xarray as xr
+
+def fft2d_save(ds, var, save_complex=False, save_both=False):
+    data = ds[var]
+    fft_complex = np.fft.fftshift(np.fft.fft2(data))
+
+    amp = np.abs(fft_complex)
+    phase = np.angle(fft_complex)
+
+    out = xr.Dataset()
+
+    out[f"{var}_amp"] = (data.dims, amp)
+    out[f"{var}_phase"] = (data.dims, phase)
+
+    msg = "FFT result saved as: amplitude + phase"
+
+    if save_complex or save_both:
+        out[f"{var}_real"] = (data.dims, fft_complex.real)
+        out[f"{var}_imag"] = (data.dims, fft_complex.imag)
+        msg = "FFT result saved as: real + imaginary"
+
+    if save_both:
+        msg = "FFT result saved as: amplitude+phase and real+imaginary"
+
+    print(msg)
+
+    # attrs sanitize
+    out.attrs = {
+        k: (float(v) if np.isscalar(v) else str(v))
+        for k, v in ds.attrs.items()
+    }
+
+    return out
+
+
+def ifft2d_from_ds(ds, var):
+    if f"{var}_real" in ds and f"{var}_imag" in ds:
+        complex_data = ds[f"{var}_real"] + 1j * ds[f"{var}_imag"]
+        print("IFFT computed from real + imaginary channels")
+    else:
+        amp = ds[f"{var}_amp"]
+        phase = ds[f"{var}_phase"]
+        complex_data = amp * np.exp(1j * phase)
+        print("IFFT computed from amplitude + phase channels")
+
+    ifft_data = np.fft.ifft2(np.fft.ifftshift(complex_data))
+
+    return xr.DataArray(
+        np.real(ifft_data),
+        dims=complex_data.dims,
+        coords=complex_data.coords,
+        name=f"{var}_ifft"
+    )
+

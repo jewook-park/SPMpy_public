@@ -1,11 +1,11 @@
 # ---
 # jupyter:
 #   jupytext:
-#     formats: ipynb,py:percent
+#     formats: ipynb,py:light
 #     text_representation:
 #       extension: .py
-#       format_name: percent
-#       format_version: '1.3'
+#       format_name: light
+#       format_version: '1.5'
 #       jupytext_version: 1.18.1
 #   kernelspec:
 #     display_name: Python 3 (ipykernel)
@@ -13,7 +13,6 @@
 #     name: python3
 # ---
 
-# %% [markdown]
 #
 # # Plateau-based Tilt Removal for STM (sxm images)
 #
@@ -106,7 +105,7 @@
 # ```
 #
 
-# %%
+# +
 
 import numpy as np
 import xarray as xr
@@ -218,4 +217,200 @@ def plateau_tilt_xr(
         }
 
     return out
+
+
+
+# -
+
+#
+# ## 🧭 Plateau Existence Decision Logic (Pre-Fit Validation)
+#
+# ### Motivation
+# Plateau fitting should **only** be performed when a physically meaningful
+# flat (plane-like) region exists in the image. Blindly applying plateau fitting
+# can lead to unstable parameters and misleading results.
+#
+# Therefore, a **pre-fit validation step** is introduced.
+#
+# ---
+#
+# ### Plateau / Plane Detection Strategy
+#
+# 1. **Plane-like region detection**
+#    - A plane (low-gradient region) is identified based on a local gradient
+#      or residual criterion (implementation-dependent).
+#    - Only pixels satisfying the plane criterion are considered
+#      *plateau candidates*.
+#
+# 2. **Area fraction requirement**
+#    - Let:
+#      - `N_plateau` = number of pixels classified as plateau
+#      - `N_total` = total number of pixels in the image
+#    - Plateau fitting is allowed **only if**:
+#      ```
+#      (N_plateau / N_total) ≥ 0.10
+#      ```
+#      i.e. at least **10% of the total image area**.
+#
+# ---
+#
+# ### Control Flow
+#
+# 1. Existing preprocessing (tilt removal, background correction, etc.) runs first.
+# 2. Plateau candidate region is evaluated.
+# 3. A message is printed:
+#    - If no valid plane is found:
+#      - `"No plateau region detected — plateau fitting skipped."`
+#    - If a plane is found:
+#      - `"Plateau region detected: XX.X% of total area."`
+# 4. Plateau fitting is executed **only if** the area threshold is satisfied.
+#
+# ---
+#
+# ### Design Principles
+# - Existing plateau fitting logic is **unchanged**
+# - Decision logic is **additive and explicit**
+# - No side effects on downstream analysis
+# - Messages are always printed before fitting
+#
+# This ensures transparent, reproducible, and physically meaningful plateau analysis.
+#
+
+# +
+
+import numpy as np
+import xarray as xr
+
+def detect_plateau_region(
+    data: np.ndarray,
+    gradient_threshold: float,
+):
+    """
+    Detect plane-like (plateau) regions based on gradient magnitude.
+
+    Parameters
+    ----------
+    data : np.ndarray
+        2D input image.
+    gradient_threshold : float
+        Threshold on gradient magnitude below which pixels
+        are considered part of a plane.
+
+    Returns
+    -------
+    plateau_mask : np.ndarray of bool
+        Boolean mask indicating plateau candidate pixels.
+    """
+    gy, gx = np.gradient(data)
+    grad_mag = np.sqrt(gx**2 + gy**2)
+    plateau_mask = grad_mag < gradient_threshold
+    return plateau_mask
+
+
+def plateau_area_fraction(plateau_mask: np.ndarray) -> float:
+    """
+    Compute the fractional area occupied by the plateau region.
+
+    Parameters
+    ----------
+    plateau_mask : np.ndarray of bool
+
+    Returns
+    -------
+    fraction : float
+        Plateau area fraction relative to the full image.
+    """
+    return np.count_nonzero(plateau_mask) / plateau_mask.size
+
+
+def should_run_plateau_fit(
+    data: np.ndarray,
+    gradient_threshold: float,
+    min_fraction: float = 0.10,
+):
+    """
+    Decide whether plateau fitting should be performed.
+
+    The decision is based on whether a plane-like region
+    exists and occupies at least a minimum fraction
+    of the total image area.
+
+    Parameters
+    ----------
+    data : np.ndarray
+        2D image after preprocessing.
+    gradient_threshold : float
+        Gradient magnitude threshold for plane detection.
+    min_fraction : float, optional
+        Minimum required plateau area fraction (default: 0.10).
+
+    Returns
+    -------
+    run_fit : bool
+        Whether plateau fitting should be executed.
+    plateau_fraction : float
+        Detected plateau area fraction.
+    plateau_mask : np.ndarray of bool
+        Mask of detected plateau region.
+    """
+    plateau_mask = detect_plateau_region(data, gradient_threshold)
+    fraction = plateau_area_fraction(plateau_mask)
+
+    if fraction == 0.0:
+        print("No plateau region detected — plateau fitting skipped.")
+        return False, fraction, plateau_mask
+
+    print(
+        f"Plateau region detected: {fraction * 100:.1f}% of total area."
+    )
+
+    if fraction < min_fraction:
+        print(
+            f"Plateau area below threshold ({min_fraction * 100:.0f}%) — fitting skipped."
+        )
+        return False, fraction, plateau_mask
+
+    return True, fraction, plateau_mask
+
+
+def run_plateau_fit_if_valid(
+    data: np.ndarray,
+    gradient_threshold: float,
+    min_fraction: float,
+    plateau_fit_func,
+    *args,
+    **kwargs,
+):
+    """
+    Wrapper that conditionally executes plateau fitting.
+
+    Parameters
+    ----------
+    data : np.ndarray
+        2D image after preprocessing.
+    gradient_threshold : float
+        Threshold for plane detection.
+    min_fraction : float
+        Minimum required plateau area fraction.
+    plateau_fit_func : callable
+        Existing plateau fitting function.
+    *args, **kwargs :
+        Passed directly to `plateau_fit_func`.
+
+    Returns
+    -------
+    result or None
+        Output of `plateau_fit_func` if executed,
+        otherwise None.
+    """
+    run_fit, frac, mask = should_run_plateau_fit(
+        data,
+        gradient_threshold,
+        min_fraction,
+    )
+
+    if not run_fit:
+        return None
+
+    return plateau_fit_func(data, mask=mask, *args, **kwargs)
 
