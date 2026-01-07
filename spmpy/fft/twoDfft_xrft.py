@@ -1,11 +1,11 @@
 # ---
 # jupyter:
 #   jupytext:
-#     formats: ipynb,py:percent
+#     formats: ipynb,py:light
 #     text_representation:
 #       extension: .py
-#       format_name: percent
-#       format_version: '1.3'
+#       format_name: light
+#       format_version: '1.5'
 #       jupytext_version: 1.18.1
 #   kernelspec:
 #     display_name: Python 3 (ipykernel)
@@ -13,7 +13,6 @@
 #     name: python3
 # ---
 
-# %% [markdown]
 # # twoDfft_xrft / twoDifft_xrft — 2D FFT and inverse FFT Utilities for STM Images (xarray)
 #
 # This notebook documents the **forward and inverse 2D Fourier transform utilities**
@@ -155,7 +154,7 @@
 # - Retaining the complex FFT output enables mathematically consistent inverse FFT
 #   and frequency-domain filtering workflows.
 
-# %%
+# +
 import numpy as np
 import xarray as xr
 
@@ -252,7 +251,7 @@ def twoDfft_xrft(
     return out
 
 
-# %%
+# +
 import numpy as np
 import xarray as xr
 
