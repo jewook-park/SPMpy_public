@@ -414,3 +414,171 @@ def run_plateau_fit_if_valid(
 
     return plateau_fit_func(data, mask=mask, *args, **kwargs)
 
+
+
+# -
+
+#
+# ## 🧯 Fix for `TypeError: Invalid value for attr ... {dict}` when saving to NetCDF
+#
+# ### Why this happens
+# `xarray.Dataset.to_netcdf()` validates that **attribute values** are NetCDF-serializable.
+# A Python `dict` stored in `ds.attrs[...]` (e.g. `ds.attrs["Z_fwd_plateau_tilt"] = {...}`)
+# is **not** directly serializable, so `to_netcdf()` raises:
+#
+# - `TypeError: Invalid value for attr '...': {...dict...}`
+#
+# ### Policy (no side effects)
+# - **Do not modify** existing attrs in the in-memory Dataset used for analysis
+# - Make a **shallow copy only for writing**, and convert *only the new plateau attrs*
+#   (or any explicitly-scoped attrs) to a NetCDF-safe representation.
+#
+# ### Recommended representation
+# - Convert dict-like plateau metadata to a **JSON string** at write time.
+#   - Human-readable
+#   - Reversible (can be loaded back with `json.loads`)
+#   - NetCDF-safe (`str`)
+#
+# ### Two ways to use
+# 1. **Explicit key list**: if you know which attrs were added after plateau.
+# 2. **Snapshot-based auto detection**: capture attrs before plateau, then after plateau;
+#    only newly-added or modified keys are sanitized at save time.
+#
+
+# +
+
+import json
+import numpy as np
+import xarray as xr
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, Optional, Tuple
+
+def _attr_value_to_netcdf_safe(value: Any) -> Any:
+    """
+    Convert a single attribute value to a NetCDF-safe type.
+
+    Rules
+    -----
+    - Keep: str, numbers, numpy scalars, bytes, lists/tuples of basic scalars
+    - Convert: dict -> JSON string
+    - Keep: numpy arrays (NetCDF supports ndarray attrs)
+    - Fallback: any other object -> string
+    """
+    # dict -> JSON string (preferred for structured metadata)
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+    # numpy arrays are allowed in attrs for NetCDF
+    if isinstance(value, np.ndarray):
+        return value
+
+    # scalar numbers / numpy scalars / strings
+    if np.isscalar(value):
+        if isinstance(value, str):
+            return value
+        try:
+            return value.item()
+        except Exception:
+            return value
+
+    # list/tuple: ensure elements are simple
+    if isinstance(value, (list, tuple)):
+        safe_list = []
+        for v in value:
+            if isinstance(v, dict):
+                safe_list.append(json.dumps(v, ensure_ascii=False, sort_keys=True))
+            elif np.isscalar(v) and not isinstance(v, str):
+                try:
+                    safe_list.append(v.item())
+                except Exception:
+                    safe_list.append(v)
+            else:
+                safe_list.append(str(v))
+        return type(value)(safe_list)
+
+    # bytes is valid for some engines
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value)
+
+    # fallback: stringify
+    return str(value)
+
+
+def to_netcdf_scoped_attrs(
+    ds: xr.Dataset,
+    path: str,
+    scoped_attr_keys: Iterable[str],
+    encoding: Optional[Dict[str, Dict[str, Any]]] = None,
+    **to_netcdf_kwargs,
+) -> None:
+    """
+    Write a Dataset to NetCDF while sanitizing ONLY the specified attrs.
+
+    Important
+    ---------
+    - The input Dataset `ds` is NOT modified.
+    - A shallow copy is created for writing.
+    """
+    attrs_out = dict(ds.attrs)
+    for k in scoped_attr_keys:
+        if k in attrs_out:
+            attrs_out[k] = _attr_value_to_netcdf_safe(attrs_out[k])
+
+    ds_out = ds.copy(deep=False)
+    ds_out.attrs = attrs_out
+
+    ds_out.to_netcdf(path, encoding=encoding or {}, **to_netcdf_kwargs)
+    print(f"NetCDF written (scoped attrs only) to: {path}")
+
+
+@dataclass
+class AttrSnapshot:
+    """
+    Snapshot Dataset attrs and compute which keys are new/changed.
+
+    Usage
+    -----
+    snap = AttrSnapshot.from_dataset(ds_before_plateau)
+    # ... plateau processing that adds/modifies ds.attrs ...
+    keys = snap.diff(ds_after_plateau)
+    to_netcdf_scoped_attrs(ds_after_plateau, "out.nc", keys)
+    """
+    baseline: Dict[str, Any]
+
+    @classmethod
+    def from_dataset(cls, ds: xr.Dataset) -> "AttrSnapshot":
+        return cls(baseline=dict(ds.attrs))
+
+    def diff(self, ds: xr.Dataset) -> Tuple[str, ...]:
+        """
+        Return keys that are newly added or changed vs baseline.
+
+        Notes
+        -----
+        - Best-effort equality check that tolerates dict/list/ndarray.
+        """
+        current = dict(ds.attrs)
+        keys = set(current.keys()) | set(self.baseline.keys())
+        changed = []
+        for k in keys:
+            if k not in self.baseline:
+                changed.append(k)
+                continue
+            if k not in current:
+                continue
+
+            a = self.baseline[k]
+            b = current[k]
+
+            try:
+                eq = (a == b)
+                if isinstance(eq, np.ndarray):
+                    eq = bool(np.all(eq))
+            except Exception:
+                eq = (str(a) == str(b))
+
+            if not eq:
+                changed.append(k)
+
+        return tuple(sorted(changed))
+
