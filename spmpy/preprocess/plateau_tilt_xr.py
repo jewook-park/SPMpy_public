@@ -123,15 +123,38 @@ def plateau_tilt_xr(
 ):
     """
     Plateau (terrace) based tilt removal for 2D STM images (sxm).
-
+    
+    This function estimates and removes a *global linear tilt* from 2D STM data
+    by identifying plateau (terrace) regions separated by step edges and
+    averaging the slopes fitted on those plateaus.
+    
     Notes
     -----
-    - Only global linear tilt (a*x + b*y) is removed.
-    - Absolute height offsets and step heights are preserved.
-    - Plateau detection is gradient-based and may require tuning of grad_sigma.
-    - If store_plateau_mask=True, detected plateau regions are stored
-      in the output dataset for inspection.
+    - Only the global linear tilt (a*x + b*y) is removed.
+      Absolute height offsets and physical step heights between plateaus
+      are intentionally preserved.
+    
+    - Plateau detection is *gradient-based* and relies on Gaussian smoothing
+      (`grad_sigma`) prior to step-edge detection.
+    
+    - If plateau fitting fails or produces unexpected results
+      (e.g. step offsets appear to be removed or distorted),
+      the most common cause is *failed plateau segmentation* due to
+      insufficient smoothing.
+    
+      In such cases, users are strongly encouraged to:
+        1) Enable `store_plateau_mask=True` to inspect detected plateau regions.
+        2) Increase `grad_sigma` gradually so that step edges are clearly
+           separated in the smoothed image.
+        3) Re-run the tilt correction after confirming that distinct plateaus
+           are properly segmented.
+    
+    - The algorithm is intentionally conservative:
+      it does not attempt to automatically "fix" ambiguous segmentation,
+      but instead exposes the segmentation result for user inspection
+      and controlled parameter tuning.
     """
+
 
     if not isinstance(ds, xr.Dataset):
         raise TypeError("Input must be an xarray.Dataset")
@@ -252,8 +275,6 @@ def plateau_tilt_xr(
             )
 
     return out
-
-
 
 # -
 
