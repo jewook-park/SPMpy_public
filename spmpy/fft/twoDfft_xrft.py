@@ -1,11 +1,11 @@
 # ---
 # jupyter:
 #   jupytext:
-#     formats: ipynb,py:percent
+#     formats: ipynb,py:light
 #     text_representation:
 #       extension: .py
-#       format_name: percent
-#       format_version: '1.3'
+#       format_name: light
+#       format_version: '1.5'
 #       jupytext_version: 1.17.2
 #   kernelspec:
 #     display_name: Python 3 (ipykernel)
@@ -13,7 +13,6 @@
 #     name: python3
 # ---
 
-# %% [markdown]
 # # twoDfft_xrft / twoDifft_xrft — 2D FFT and inverse FFT Utilities for STM Images (xarray)
 #
 # This notebook documents the **forward and inverse 2D Fourier transform utilities**
@@ -155,7 +154,7 @@
 # - Retaining the complex FFT output enables mathematically consistent inverse FFT
 #   and frequency-domain filtering workflows.
 
-# %%
+# +
 import numpy as np
 import xarray as xr
 import xrft
@@ -163,80 +162,160 @@ import xrft
 
 def twoDfft_xrft(
     ds: xr.Dataset,
-    ch: str = "all",
-    overwrite: bool = False,
+    ch="all",
     mask=None,
+    keep_original: bool = False,
+    **fft_kwargs,
 ):
     """
     Perform a safe 2D Fourier transform on STM images using xrft.
 
-    FFT is computed using xrft.fft to preserve coordinate consistency
-    and physical frequency axes.
+    This function is a thin, STM-oriented wrapper around ``xrft.fft``.
+    It provides physically consistent default settings for STM data,
+    while exposing the full flexibility of ``xrft.fft`` through
+    keyword arguments.
 
-    NetCDF-safe complex storage
-    ---------------------------
-    - Complex FFT results are internally computed.
-    - For NetCDF compatibility, complex values are additionally stored as:
-        * <var>_fft_complex_real
-        * <var>_fft_complex_imag
-    - Amplitude and phase are always stored.
+    Real-space mask behavior
+    ------------------------
+    If ``mask`` is provided, it is applied in real space BEFORE FFT.
+    True values are kept, False values are zeroed. This is conceptually
+    distinct from windowing or padding options handled by ``xrft.fft``.
+
+    Default xrft.fft behavior (STM-friendly)
+    ----------------------------------------
+    - dim = ("Y", "X")
+    - true_phase = True
+    - true_amplitude = True
+
+    These defaults can be overridden by explicitly passing keyword
+    arguments via ``fft_kwargs``.
+
+    Parameters
+    ----------
+    ds : xr.Dataset
+        Input Dataset containing real-space STM images.
+    ch : "all", str, or list/tuple of str
+        Channel(s) to transform.
+
+        Selection rules:
+        - "all":
+            Apply FFT to all data variables.
+        - str:
+            1) If exact match exists → use that variable only.
+            2) Otherwise → apply FFT to all variables whose names
+               contain the given string.
+        - list/tuple:
+            Each element is treated independently using the rules above.
+    mask : xr.DataArray or array-like, optional
+        Real-space mask applied BEFORE FFT.
+        True values are kept; False values are zeroed.
+    keep_original : bool, default False
+        If True, keep original real-space data variables in the output Dataset.
+        X and Y coordinates are always preserved.
+    **fft_kwargs
+        Additional keyword arguments passed directly to ``xrft.fft``.
+        Examples include:
+        - window
+        - detrend
+        - padding
+        - real_dim
+        - shift
+        - chunks_to_segments
+
+    Returns
+    -------
+    xr.Dataset
+        Dataset containing FFT-domain variables:
+        - <var>_fft_complex_real
+        - <var>_fft_complex_imag
+        - <var>_fft_amp
+        - <var>_fft_phase
+
+        Coordinates:
+        - freq_X, freq_Y (from xrft)
+        - X, Y (always preserved)
     """
 
     if not isinstance(ds, xr.Dataset):
         raise TypeError("Input must be an xarray.Dataset")
 
+    # ------------------------------------------------------------
+    # Channel selection logic
+    # ------------------------------------------------------------
+    data_vars = list(ds.data_vars)
+    ch_list = []
+
     if ch == "all":
-        ch_list = list(ds.data_vars)
+        ch_list = data_vars
+
+    elif isinstance(ch, str):
+        if ch in data_vars:
+            ch_list = [ch]
+        else:
+            ch_list = [v for v in data_vars if ch in v]
+            if not ch_list:
+                raise ValueError(
+                    f"No data variables match channel key '{ch}'"
+                )
+
+    elif isinstance(ch, (list, tuple)):
+        for key in ch:
+            if key in data_vars:
+                ch_list.append(key)
+            else:
+                matches = [v for v in data_vars if key in v]
+                ch_list.extend(matches)
+
+        ch_list = sorted(set(ch_list))
+        if not ch_list:
+            raise ValueError("No data variables match given channel keys")
+
     else:
-        if ch not in ds.data_vars:
-            raise ValueError(f"Channel '{ch}' not found in Dataset")
-        ch_list = [ch]
+        raise TypeError("ch must be 'all', a string, or a list/tuple")
 
-    out = ds.copy()
+    # ------------------------------------------------------------
+    # Prepare output Dataset (X/Y always preserved)
+    # ------------------------------------------------------------
+    out = xr.Dataset(
+        coords={
+            "Y": ds["Y"],
+            "X": ds["X"],
+        },
+        attrs=ds.attrs,
+    )
 
+    # ------------------------------------------------------------
+    # xrft.fft default arguments (STM-safe)
+    # ------------------------------------------------------------
+    fft_defaults = dict(
+        dim=("Y", "X"),
+        true_phase=True,
+        true_amplitude=True,
+    )
+    fft_params = {**fft_defaults, **fft_kwargs}
+
+    # ------------------------------------------------------------
+    # FFT loop
+    # ------------------------------------------------------------
     for var in ch_list:
-        da = out[var]
+        da = ds[var]
+
         if da.ndim != 2:
             continue
 
         data = da
 
-        # ============================================================
-        # Optional real-space mask (applied BEFORE FFT)
-        # ============================================================
+        # Real-space mask (applied BEFORE FFT)
         if mask is not None:
-            m = mask if isinstance(mask, xr.DataArray) else xr.DataArray(
-                mask, dims=da.dims, coords=da.coords
-            )
+            if isinstance(mask, xr.DataArray):
+                m = mask
+            else:
+                m = xr.DataArray(mask, dims=da.dims, coords=da.coords)
             data = data.where(m, 0.0)
 
-        # ============================================================
-        # FFT via xrft (NO manual fftshift / fftfreq)
-        # ============================================================
-        fft_da = xrft.fft(
-            data,
-            dim=("Y", "X"),
-            true_phase=True,
-            true_amplitude=True,
-        )
-
+        fft_da = xrft.fft(data, **fft_params)
         fft_complex = fft_da.values
-        fft_amp = np.abs(fft_complex)
-        fft_phase = np.angle(fft_complex)
 
-        # ------------------------------------------------------------
-        # Store complex FFT (in-memory)
-        # ------------------------------------------------------------
-        out[f"{var}_fft_complex"] = xr.DataArray(
-            fft_complex,
-            dims=fft_da.dims,
-            coords=fft_da.coords,
-            attrs=da.attrs,
-        )
-
-        # ------------------------------------------------------------
-        # NetCDF-safe complex split
-        # ------------------------------------------------------------
         out[f"{var}_fft_complex_real"] = xr.DataArray(
             np.real(fft_complex),
             dims=fft_da.dims,
@@ -252,20 +331,30 @@ def twoDfft_xrft(
         )
 
         out[f"{var}_fft_amp"] = xr.DataArray(
-            fft_amp,
+            np.abs(fft_complex),
             dims=fft_da.dims,
             coords=fft_da.coords,
             attrs=da.attrs,
         )
 
         out[f"{var}_fft_phase"] = xr.DataArray(
-            fft_phase,
+            np.angle(fft_complex),
             dims=fft_da.dims,
             coords=fft_da.coords,
             attrs=da.attrs,
         )
 
-    # Automatic reciprocal reference (NetCDF-safe: scalar only)
+    # ------------------------------------------------------------
+    # Keep original real-space data if requested
+    # ------------------------------------------------------------
+    if keep_original:
+        for var in ds.data_vars:
+            if var not in out.data_vars:
+                out[var] = ds[var]
+
+    # ------------------------------------------------------------
+    # Automatic reciprocal reference (scalar, NetCDF-safe)
+    # ------------------------------------------------------------
     if "ref_a0_nm" in out.attrs:
         try:
             a0_nm = float(out.attrs["ref_a0_nm"])
@@ -278,133 +367,194 @@ def twoDfft_xrft(
 
 
 
-# %%
+# +
 import numpy as np
 import xarray as xr
 import xrft
 
 
+def _infer_realspace_coord(freq: xr.DataArray, name: str):
+    """
+    Infer a uniformly spaced real-space coordinate from a frequency axis.
+
+    Assumptions:
+    - Uniform spacing in frequency
+    - xrft convention: df = 1 / (N * dx)
+    - Absolute origin is unknown → centered at 0
+    """
+    f = np.asarray(freq.values)
+
+    if f.size < 2:
+        raise ValueError(f"Cannot infer {name} from frequency axis (size < 2)")
+
+    f_sorted = np.sort(np.unique(f))
+    df = np.median(np.diff(f_sorted))
+
+    if not np.isfinite(df) or df == 0:
+        raise ValueError(f"Invalid frequency spacing for {name}")
+
+    N = freq.size
+    dx = 1.0 / (N * df)
+    x = (np.arange(N) - N // 2) * dx
+
+    return xr.DataArray(x, dims=(name,), coords={name: x})
+
+
 def twoDifft_xrft(
-    # [ADDED] Optional reciprocal-space mask support
-    # mask: boolean array or xarray.DataArray, True = include in iFFT
-
     ds_fft: xr.Dataset,
-    ch: str,
-    use_complex: bool = True,
-    overwrite: bool = False,
-    mask=None,  # [ADDED] Optional FFT-space mask
-
+    ch="all",
+    mask=None,
 ):
     """
-    Perform a safe inverse 2D Fourier transform to reconstruct real-space STM images
-    using xrft.ifft.
+    Perform inverse 2D Fourier transforms from xrft-based FFT results.
 
-    This function reconstructs real-space data from FFT-domain variables produced
-    by `twoDfft_xrft`.
+    Coordinate handling
+    -------------------
+    - freq_X, freq_Y are required
+    - If X,Y exist in ds_fft → use them
+    - Else → infer X,Y from frequency spacing
 
-    IFFT input priority (NetCDF-safe)
-    ---------------------------------
-    1. If <ch>_fft_complex_real AND <ch>_fft_complex_imag exist:
-        → reconstruct complex spectrum from real + imaginary parts
-    2. Else if use_complex=True and <ch>_fft_complex exists:
-        → use in-memory complex spectrum
-    3. Else:
-        → reconstruct complex spectrum from amplitude + phase
+    Channel discovery (mirrors twoDfft_xrft)
+    ----------------------------------------
+    - ch = "all": search all data_vars
+    - ch = str: search data_vars containing the string
+    - ch = list/tuple: each element used as independent search key
 
-    NetCDF compatibility
-    --------------------
-    - Complex FFT data are split into real/imaginary components to ensure NetCDF safety.
-    - This function transparently reconstructs the complex spectrum as needed.
+    Complex reconstruction priority
+    --------------------------------
+    1. <base>_fft_complex_real & _imag
+    2. <base>_fft_amp & _phase
 
-    Mask behavior (additive, optional)
-    ----------------------------------
-    - If mask is None (default):
-        Identical behavior to the original implementation.
-    - If mask is provided:
-        mask=True   → included in iFFT
-        mask=False  → excluded (set to zero in frequency space)
+    Mask behavior
+    -------------
+    mask == True → keep
+    mask == False → zero
+
+    Output
+    ------
+    - Dataset containing ONLY real-space <base>_ifft
+    - dims: (Y, X)
+    - coords: X, Y only
     """
 
     if not isinstance(ds_fft, xr.Dataset):
         raise TypeError("Input must be an xarray.Dataset")
 
+    # freq axes are mandatory
     if "freq_X" not in ds_fft.coords or "freq_Y" not in ds_fft.coords:
-        raise ValueError("Dataset must contain 'freq_X' and 'freq_Y' coordinates")
+        raise ValueError("Dataset must contain freq_X and freq_Y coordinates")
 
-    var = ch
+    data_vars = list(ds_fft.data_vars)
 
-    # ============================================================
-    # Reconstruct complex FFT spectrum (priority order)
-    # ============================================================
-    if (
-        f"{var}_fft_complex_real" in ds_fft
-        and f"{var}_fft_complex_imag" in ds_fft
-    ):
-        fft_complex = (
-            ds_fft[f"{var}_fft_complex_real"].values
-            + 1j * ds_fft[f"{var}_fft_complex_imag"].values
+    # ------------------------------------------------------------
+    # Normalize ch into search keys
+    # ------------------------------------------------------------
+    if ch == "all":
+        search_keys = [""]
+    elif isinstance(ch, str):
+        search_keys = [ch]
+    elif isinstance(ch, (list, tuple)):
+        search_keys = list(ch)
+    else:
+        raise TypeError("ch must be 'all', str, or list/tuple")
+
+    # ------------------------------------------------------------
+    # Discover valid base names
+    # ------------------------------------------------------------
+    bases = set()
+
+    for key in search_keys:
+        for v in data_vars:
+            if key not in v:
+                continue
+
+            if v.endswith("_fft_complex_real"):
+                base = v.replace("_fft_complex_real", "")
+                if f"{base}_fft_complex_imag" in data_vars:
+                    bases.add(base)
+
+            elif v.endswith("_fft_amp"):
+                base = v.replace("_fft_amp", "")
+                if f"{base}_fft_phase" in data_vars:
+                    bases.add(base)
+
+    if not bases:
+        raise ValueError("No valid FFT channel pairs found")
+
+    # ------------------------------------------------------------
+    # Determine real-space coordinates
+    # ------------------------------------------------------------
+    if "X" in ds_fft.coords and "Y" in ds_fft.coords:
+        X = ds_fft["X"]
+        Y = ds_fft["Y"]
+    else:
+        X = _infer_realspace_coord(ds_fft["freq_X"], "X")
+        Y = _infer_realspace_coord(ds_fft["freq_Y"], "Y")
+
+    # ------------------------------------------------------------
+    # Output Dataset (real-space only)
+    # ------------------------------------------------------------
+    out = xr.Dataset(coords={"Y": Y, "X": X}, attrs=ds_fft.attrs)
+
+    # ------------------------------------------------------------
+    # Inverse FFT loop
+    # ------------------------------------------------------------
+    for base in sorted(bases):
+
+        # Priority 1: real / imag
+        if (
+            f"{base}_fft_complex_real" in ds_fft
+            and f"{base}_fft_complex_imag" in ds_fft
+        ):
+            real = ds_fft[f"{base}_fft_complex_real"].values
+            imag = ds_fft[f"{base}_fft_complex_imag"].values
+            fft_complex = real + 1j * imag
+            attrs = ds_fft[f"{base}_fft_complex_real"].attrs
+
+        # Priority 2: amp / phase
+        elif (
+            f"{base}_fft_amp" in ds_fft
+            and f"{base}_fft_phase" in ds_fft
+        ):
+            amp = ds_fft[f"{base}_fft_amp"].values
+            phase = ds_fft[f"{base}_fft_phase"].values
+            fft_complex = amp * np.exp(1j * phase)
+            attrs = ds_fft[f"{base}_fft_amp"].attrs
+
+        else:
+            continue
+
+        if mask is not None:
+            m = mask.values if isinstance(mask, xr.DataArray) else mask
+            fft_complex = np.where(m, fft_complex, 0.0)
+
+        fft_da = xr.DataArray(
+            fft_complex,
+            dims=("freq_Y", "freq_X"),
+            coords={
+                "freq_Y": ds_fft["freq_Y"],
+                "freq_X": ds_fft["freq_X"],
+            },
         )
 
-    elif use_complex and f"{var}_fft_complex" in ds_fft:
-        fft_complex = ds_fft[f"{var}_fft_complex"].values
+        da_ifft = xrft.ifft(
+            fft_da,
+            dim=("freq_Y", "freq_X"),
+            true_phase=True,
+            true_amplitude=True,
+        )
 
-    else:
-        if f"{var}_fft_amp" not in ds_fft or f"{var}_fft_phase" not in ds_fft:
-            raise ValueError("Amplitude and phase required for reconstruction")
-        amp = ds_fft[f"{var}_fft_amp"].values
-        phase = ds_fft[f"{var}_fft_phase"].values
-        fft_complex = amp * np.exp(1j * phase)
-
-    # ============================================================
-    # [ADDED] Apply reciprocal-space mask BEFORE iFFT
-    # ============================================================
-    if mask is not None:
-        m = mask.values if hasattr(mask, "values") else mask
-        fft_complex = np.where(m, fft_complex, 0.0)
-
-    # ============================================================
-    # Inverse FFT via xrft (coordinates preserved)
-    # ============================================================
-    fft_da = xr.DataArray(
-        fft_complex,
-        dims=("freq_Y", "freq_X"),
-        coords={
-            "freq_Y": ds_fft["freq_Y"],
-            "freq_X": ds_fft["freq_X"],
-        },
-    )
-
-    da_ifft = xrft.ifft(
-        fft_da,
-        dim=("freq_Y", "freq_X"),
-        true_phase=True,
-        true_amplitude=True,
-    )
-
-    # xrft.ifft returns complex; STM real-space signal is real-valued
-    data_real = np.real(da_ifft.values)
-
-    if "X" not in ds_fft.coords or "Y" not in ds_fft.coords:
-        raise ValueError("Original real-space coordinates X/Y not found")
-
-    out = ds_fft.copy()
-
-    da_out = xr.DataArray(
-        data_real,
-        dims=("Y", "X"),
-        coords={"Y": ds_fft["Y"], "X": ds_fft["X"]},
-        attrs=ds_fft[ch].attrs if ch in ds_fft else {},
-    )
-
-    if overwrite:
-        out[ch] = da_out
-    else:
-        out[f"{ch}_ifft"] = da_out
+        out[f"{base}_ifft"] = xr.DataArray(
+            np.real(da_ifft.values),
+            dims=("Y", "X"),
+            coords={"Y": Y, "X": X},
+            attrs=attrs,
+        )
 
     return out
 
+# -
 
-# %% [markdown]
 # ## 🔄 FFT / IFFT Complex Data Storage Update (NetCDF-safe)
 #
 # ### FFT Storage Policy (Updated)
@@ -467,7 +617,6 @@ def twoDifft_xrft(
 # - Non-scalar objects (e.g. dict, list, ndarray) are serialized to strings before being written to NetCDF.
 
 
-# %% [markdown]
 # ## Mask-aware FFT / iFFT (Added Feature)
 #
 # This notebook now supports **optional masking** for both forward and inverse Fourier transforms.
@@ -492,4 +641,4 @@ def twoDifft_xrft(
 # - Explicit masking avoids unintended FFT artifacts from discontinuities
 #
 
-# %%
+
