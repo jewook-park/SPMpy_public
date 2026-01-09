@@ -6,7 +6,7 @@
 #       extension: .py
 #       format_name: light
 #       format_version: '1.5'
-#       jupytext_version: 1.18.1
+#       jupytext_version: 1.17.2
 #   kernelspec:
 #     display_name: Python 3 (ipykernel)
 #     language: python
@@ -119,9 +119,18 @@ def plateau_tilt_xr(
     min_plateau_area: int = 200,
     mask: np.ndarray | None = None,
     overwrite: bool = False,
+    store_plateau_mask: bool = False,
 ):
     """
     Plateau (terrace) based tilt removal for 2D STM images (sxm).
+
+    Notes
+    -----
+    - Only global linear tilt (a*x + b*y) is removed.
+    - Absolute height offsets and step heights are preserved.
+    - Plateau detection is gradient-based and may require tuning of grad_sigma.
+    - If store_plateau_mask=True, detected plateau regions are stored
+      in the output dataset for inspection.
     """
 
     if not isinstance(ds, xr.Dataset):
@@ -149,6 +158,9 @@ def plateau_tilt_xr(
         if mask is not None and mask.shape != Z.shape:
             raise ValueError("mask must have the same shape as the image")
 
+        # -------------------------------------------------
+        # Smoothing + gradient
+        # -------------------------------------------------
         Z_smooth = gaussian_filter(Z, sigma=float(grad_sigma))
         dZdy, dZdx = np.gradient(Z_smooth, y, x)
         grad = np.sqrt(dZdx**2 + dZdy**2)
@@ -170,6 +182,9 @@ def plateau_tilt_xr(
         slopes = []
         areas = []
 
+        # -------------------------------------------------
+        # Plane fitting per plateau
+        # -------------------------------------------------
         for lab in range(1, n_labels + 1):
             region = labels == lab
             area = int(np.count_nonzero(region))
@@ -211,13 +226,30 @@ def plateau_tilt_xr(
         else:
             out[f"{var}_plateautilt"] = out_da
 
-        # --- NetCDF-safe plateau attrs (FLATTENED) ---
+        # -------------------------------------------------
+        # NetCDF-safe plateau attrs (unchanged)
+        # -------------------------------------------------
         out.attrs[f"{var}_plateau_tilt_a_avg"] = float(a_avg)
         out.attrs[f"{var}_plateau_tilt_b_avg"] = float(b_avg)
         out.attrs[f"{var}_plateau_tilt_n_plateaus"] = int(len(areas))
         out.attrs[f"{var}_plateau_tilt_grad_sigma"] = float(grad_sigma)
         out.attrs[f"{var}_plateau_tilt_grad_threshold"] = float(grad_thr)
         out.attrs[f"{var}_plateau_tilt_min_plateau_area"] = int(min_plateau_area)
+
+        # -------------------------------------------------
+        # [OPTIONAL] Store plateau regions for inspection
+        # -------------------------------------------------
+        if store_plateau_mask:
+            out[f"{var}_plateau_mask"] = xr.DataArray(
+                plateau_mask,
+                coords=da.coords,
+                dims=da.dims,
+            )
+            out[f"{var}_plateau_labels"] = xr.DataArray(
+                labels.astype(np.int32),
+                coords=da.coords,
+                dims=da.dims,
+            )
 
     return out
 
